@@ -31,6 +31,26 @@ pub const WebTransportConnectResponse = struct {
     status: u16,
 };
 
+pub const SessionState = enum {
+    active,
+    closing,
+    closed,
+    errored,
+};
+
+pub const SessionInfo = struct {
+    session_id: u64,
+    stream_id: u64,
+    state: SessionState,
+};
+
+pub const SessionEvent = union(enum) {
+    opened: SessionInfo,
+    closing: SessionInfo,
+    closed: SessionInfo,
+    errored: SessionInfo,
+};
+
 pub const NegotiatedFeatures = struct {
     connect_protocol_enabled: bool,
     h3_datagram_enabled: bool,
@@ -115,7 +135,8 @@ pub const Core = struct {
     sessions_open: usize,
     negotiated: NegotiatedFeatures,
     next_session_id: u64,
-    active_sessions: std.AutoHashMap(u64, void),
+    active_sessions: std.AutoHashMap(u64, SessionInfo),
+    session_events: std.ArrayList(SessionEvent),
 
     pub fn init(allocator: std.mem.Allocator) Core {
         return .{
@@ -123,12 +144,14 @@ pub const Core = struct {
             .sessions_open = 0,
             .negotiated = NegotiatedFeatures.init(),
             .next_session_id = 1,
-            .active_sessions = std.AutoHashMap(u64, void).init(allocator),
+            .active_sessions = std.AutoHashMap(u64, SessionInfo).init(allocator),
+            .session_events = .{},
         };
     }
 
     pub fn deinit(self: *Core) void {
         self.active_sessions.deinit();
+        self.session_events.deinit(self.allocator);
     }
 
     pub fn apply_negotiated_features(self: *Core, features: NegotiatedFeatures) void {
@@ -159,26 +182,99 @@ pub const Core = struct {
         const session_id = self.next_session_id;
         self.next_session_id += 1;
 
-        self.active_sessions.put(session_id, {}) catch {
+        const info = SessionInfo{
+            .session_id = session_id,
+            .stream_id = 0,
+            .state = .active,
+        };
+
+        self.active_sessions.put(session_id, info) catch {
             return errors.FluxError.internal_failure;
         };
         self.sessions_open += 1;
+        try self.push_session_event(.{ .opened = info });
         return session_id;
+    }
+
+    pub fn register_session_with_id(self: *Core, session_id: u64, stream_id: u64) errors.FluxError!void {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        if (self.active_sessions.contains(session_id)) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (self.sessions_open >= self.negotiated.webtransport_max_sessions) {
+            return errors.FluxError.backpressure;
+        }
+
+        const info = SessionInfo{
+            .session_id = session_id,
+            .stream_id = stream_id,
+            .state = .active,
+        };
+
+        self.active_sessions.put(session_id, info) catch {
+            return errors.FluxError.internal_failure;
+        };
+        self.sessions_open += 1;
+        try self.push_session_event(.{ .opened = info });
+    }
+
+    pub fn begin_close_session(self: *Core, session_id: u64) errors.FluxError!void {
+        const info = self.active_sessions.getPtr(session_id) orelse return errors.FluxError.invalid_argument;
+        switch (info.state) {
+            .active => {
+                info.state = .closing;
+                try self.push_session_event(.{ .closing = info.* });
+            },
+            .closing, .closed => {},
+            .errored => return errors.FluxError.invalid_state,
+        }
+    }
+
+    pub fn mark_session_error(self: *Core, session_id: u64) errors.FluxError!void {
+        const info = self.active_sessions.getPtr(session_id) orelse return errors.FluxError.invalid_argument;
+        info.state = .errored;
+        try self.push_session_event(.{ .errored = info.* });
+    }
+
+    pub fn complete_close_session(self: *Core, session_id: u64) errors.FluxError!void {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state == .errored) {
+            return errors.FluxError.invalid_state;
+        }
+
+        _ = self.active_sessions.remove(session_id);
+        if (self.sessions_open > 0) {
+            self.sessions_open -= 1;
+        }
+
+        var closed_info = info;
+        closed_info.state = .closed;
+        try self.push_session_event(.{ .closed = closed_info });
     }
 
     pub fn close_session(self: *Core) void {
         if (self.sessions_open == 0) return;
         var it = self.active_sessions.iterator();
         if (it.next()) |entry| {
-            _ = self.active_sessions.remove(entry.key_ptr.*);
+            self.close_session_id(entry.key_ptr.*);
         }
-        self.sessions_open -= 1;
     }
 
     pub fn close_session_id(self: *Core, session_id: u64) void {
-        if (self.active_sessions.remove(session_id)) {
-            self.sessions_open -= 1;
+        self.begin_close_session(session_id) catch return;
+        self.complete_close_session(session_id) catch return;
+    }
+
+    pub fn next_session_event(self: *Core) ?SessionEvent {
+        if (self.session_events.items.len == 0) {
+            return null;
         }
+
+        return self.session_events.orderedRemove(0);
     }
 
     pub fn send_session_datagram(self: *Core, adapter: *transport_adapter.Adapter, session_id: u64, context_id: u64, payload: []const u8) errors.FluxError!usize {
@@ -186,7 +282,8 @@ pub const Core = struct {
             return errors.FluxError.invalid_state;
         }
 
-        if (!self.active_sessions.contains(session_id)) {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
             return errors.FluxError.invalid_argument;
         }
 
@@ -227,7 +324,8 @@ pub const Core = struct {
             return errors.FluxError.protocol_violation;
         }
 
-        if (!self.active_sessions.contains(sid_vi.value)) {
+        const info = self.active_sessions.get(sid_vi.value) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
             return errors.FluxError.invalid_argument;
         }
 
@@ -249,6 +347,12 @@ pub const Core = struct {
 
     pub fn free_session_datagram(self: *Core, datagram: SessionDatagram) void {
         self.allocator.free(datagram.payload);
+    }
+
+    fn push_session_event(self: *Core, event: SessionEvent) errors.FluxError!void {
+        self.session_events.append(self.allocator, event) catch {
+            return errors.FluxError.internal_failure;
+        };
     }
 
     pub fn encode_connect_request(self: *Core, request: WebTransportConnectRequest) errors.FluxError![]u8 {
@@ -473,18 +577,67 @@ test "negotiation matrix requires connect protocol and webtransport" {
 
     var features = n.negotiate();
     try std.testing.expect(!features.supports_webtransport());
-    try std.testing.expectEqual(TransportPreference.capsule_only, (Core{
-        .allocator = std.testing.allocator,
-        .sessions_open = 0,
-        .negotiated = features,
-        .next_session_id = 1,
-        .active_sessions = std.AutoHashMap(u64, void).init(std.testing.allocator),
-    }).preferred_transport());
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(features);
+    try std.testing.expectEqual(TransportPreference.capsule_only, core.preferred_transport());
 
     n.set_peer_connect_protocol(true);
     features = n.negotiate();
     try std.testing.expect(features.supports_webtransport());
     try std.testing.expect(features.supports_webtransport_datagrams());
+}
+
+test "session registry rejects duplicate ids and emits lifecycle events" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 4,
+    });
+
+    try core.register_session_with_id(42, 13);
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.register_session_with_id(42, 15));
+
+    const opened = core.next_session_event().?;
+    try std.testing.expect(opened == .opened);
+    try std.testing.expectEqual(@as(u64, 42), opened.opened.session_id);
+
+    try core.begin_close_session(42);
+    const closing = core.next_session_event().?;
+    try std.testing.expect(closing == .closing);
+    try std.testing.expectEqual(SessionState.closing, closing.closing.state);
+
+    try core.complete_close_session(42);
+    const closed = core.next_session_event().?;
+    try std.testing.expect(closed == .closed);
+    try std.testing.expectEqual(SessionState.closed, closed.closed.state);
+}
+
+test "session close race is idempotent" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = false,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    try core.register_session_with_id(7, 21);
+    _ = core.next_session_event();
+
+    core.close_session_id(7);
+    core.close_session_id(7);
+
+    const e1 = core.next_session_event().?;
+    const e2 = core.next_session_event().?;
+    try std.testing.expect(e1 == .closing);
+    try std.testing.expect(e2 == .closed);
+    try std.testing.expect(core.next_session_event() == null);
+    try std.testing.expectEqual(@as(usize, 0), core.sessions_open);
 }
 
 test "negotiation fallback chooses capsule-only when datagram disabled" {
