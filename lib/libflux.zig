@@ -2,6 +2,7 @@ const std = @import("std");
 pub const transport_adapter = @import("transport_adapter.zig");
 pub const transport_harness = @import("transport_harness.zig");
 pub const h3_core = @import("h3_core.zig");
+pub const h3_control_reader = @import("h3_control_reader.zig");
 pub const qpack = @import("qpack.zig");
 pub const wt_core = @import("wt_core.zig");
 pub const public_api = @import("public_api.zig");
@@ -70,4 +71,8 @@ test "runtime rejects late start" {
     var runtime = Runtime.init(arena.allocator());
     try runtime.start_with_alpn("h3");
     try std.testing.expectError(errors.FluxError.invalid_state, runtime.start_with_alpn("h3"));
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

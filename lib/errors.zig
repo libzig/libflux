@@ -3,6 +3,8 @@ const std = @import("std");
 pub const FluxError = error{
     invalid_argument,
     invalid_state,
+    settings_error,
+    missing_settings,
     protocol_violation,
     frame_unexpected,
     stream_closed,
@@ -34,6 +36,8 @@ pub fn map_error_to_h3_close_code(err: anyerror) H3CloseCode {
     return switch (err) {
         FluxError.invalid_argument => .frame_error,
         FluxError.invalid_state => .general_protocol_error,
+        FluxError.settings_error => .settings_error,
+        FluxError.missing_settings => .missing_settings,
         FluxError.protocol_violation => .general_protocol_error,
         FluxError.frame_unexpected => .frame_unexpected,
         FluxError.stream_closed => .closed_critical_stream,
