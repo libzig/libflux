@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const transport_adapter = @import("transport_adapter.zig");
+pub const transport_harness = @import("transport_harness.zig");
 pub const h3_core = @import("h3_core.zig");
 pub const qpack = @import("qpack.zig");
 pub const wt_core = @import("wt_core.zig");
