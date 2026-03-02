@@ -1,0 +1,6 @@
+# source_test	libflux_target	status	notes
+xtra/lsquic/tests/test_hcsi_reader.c	tests/parity/lsquic/h3_control_reader.zig	pending	Translate control stream parser vectors first
+xtra/lsquic/tests/test_h3_framing.c	tests/parity/lsquic/h3_framing.zig	pending	Translate framing split/chunk and zero-length DATA scenarios
+xtra/lsquic/tests/test_send_headers.c	tests/parity/lsquic/h3_send_headers.zig	pending	Translate header send semantics and partial-write behavior
+xtra/lsquic/src/liblsquic/lsquic_stream.c (WT paths)	tests/parity/lsquic/wt_streams.zig	pending	Behavior-derived parity; no dedicated WT upstream test file in this snapshot
+xtra/lsquic/src/liblsquic/lsquic_hcso_writer.c (WT settings)	tests/parity/lsquic/wt_settings.zig	pending	Validate settings IDs 0x2b603742, 0x2b603743, and 0x33 behavior
