@@ -51,6 +51,23 @@ pub const SessionEvent = union(enum) {
     errored: SessionInfo,
 };
 
+pub const StreamKind = enum {
+    bidi,
+    uni,
+};
+
+pub const StreamState = enum {
+    open,
+    closed,
+};
+
+pub const SessionStream = struct {
+    stream_id: u64,
+    session_id: u64,
+    kind: StreamKind,
+    state: StreamState,
+};
+
 pub const NegotiatedFeatures = struct {
     connect_protocol_enabled: bool,
     h3_datagram_enabled: bool,
@@ -137,6 +154,8 @@ pub const Core = struct {
     next_session_id: u64,
     active_sessions: std.AutoHashMap(u64, SessionInfo),
     session_events: std.ArrayList(SessionEvent),
+    next_stream_id: u64,
+    active_streams: std.AutoHashMap(u64, SessionStream),
 
     pub fn init(allocator: std.mem.Allocator) Core {
         return .{
@@ -146,10 +165,13 @@ pub const Core = struct {
             .next_session_id = 1,
             .active_sessions = std.AutoHashMap(u64, SessionInfo).init(allocator),
             .session_events = .{},
+            .next_stream_id = 1,
+            .active_streams = std.AutoHashMap(u64, SessionStream).init(allocator),
         };
     }
 
     pub fn deinit(self: *Core) void {
+        self.active_streams.deinit();
         self.active_sessions.deinit();
         self.session_events.deinit(self.allocator);
     }
@@ -246,6 +268,20 @@ pub const Core = struct {
             return errors.FluxError.invalid_state;
         }
 
+        var stream_ids_to_remove: std.ArrayList(u64) = .{};
+        defer stream_ids_to_remove.deinit(self.allocator);
+
+        var stream_it = self.active_streams.iterator();
+        while (stream_it.next()) |entry| {
+            if (entry.value_ptr.session_id == session_id) {
+                stream_ids_to_remove.append(self.allocator, entry.key_ptr.*) catch return errors.FluxError.internal_failure;
+            }
+        }
+
+        for (stream_ids_to_remove.items) |stream_id| {
+            _ = self.active_streams.remove(stream_id);
+        }
+
         _ = self.active_sessions.remove(session_id);
         if (self.sessions_open > 0) {
             self.sessions_open -= 1;
@@ -275,6 +311,80 @@ pub const Core = struct {
         }
 
         return self.session_events.orderedRemove(0);
+    }
+
+    pub fn open_session_stream(self: *Core, session_id: u64, kind: StreamKind) errors.FluxError!u64 {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.invalid_state;
+        }
+
+        const stream_id = self.next_stream_id;
+        self.next_stream_id += 1;
+
+        self.active_streams.put(stream_id, .{
+            .stream_id = stream_id,
+            .session_id = session_id,
+            .kind = kind,
+            .state = .open,
+        }) catch return errors.FluxError.internal_failure;
+
+        return stream_id;
+    }
+
+    pub fn encode_stream_preface(self: *Core, session_id: u64) errors.FluxError![]u8 {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+
+        try append_varint(self.allocator, &out, session_id);
+        return out.toOwnedSlice(self.allocator) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn accept_session_stream(self: *Core, stream_id: u64, kind: StreamKind, preface: []const u8) errors.FluxError!u64 {
+        if (self.active_streams.contains(stream_id)) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        const sid = decode_varint(preface) orelse return errors.FluxError.protocol_violation;
+        if (sid.consumed != preface.len) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        const info = self.active_sessions.get(sid.value) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.invalid_state;
+        }
+
+        self.active_streams.put(stream_id, .{
+            .stream_id = stream_id,
+            .session_id = sid.value,
+            .kind = kind,
+            .state = .open,
+        }) catch return errors.FluxError.internal_failure;
+
+        return sid.value;
+    }
+
+    pub fn get_stream_session_id(self: *Core, stream_id: u64) ?u64 {
+        const stream = self.active_streams.get(stream_id) orelse return null;
+        return stream.session_id;
+    }
+
+    pub fn close_session_stream(self: *Core, stream_id: u64) errors.FluxError!void {
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state == .closed) {
+            _ = self.active_streams.remove(stream_id);
+            return;
+        }
+
+        var closed_stream = stream;
+        closed_stream.state = .closed;
+        self.active_streams.put(stream_id, closed_stream) catch return errors.FluxError.internal_failure;
     }
 
     pub fn send_session_datagram(self: *Core, adapter: *transport_adapter.Adapter, session_id: u64, context_id: u64, payload: []const u8) errors.FluxError!usize {
@@ -638,6 +748,74 @@ test "session close race is idempotent" {
     try std.testing.expect(e2 == .closed);
     try std.testing.expect(core.next_session_event() == null);
     try std.testing.expectEqual(@as(usize, 0), core.sessions_open);
+}
+
+test "session stream association for bidi and uni streams" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 4,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const local_bidi_stream_id = try core.open_session_stream(session_id, .bidi);
+    const local_uni_stream_id = try core.open_session_stream(session_id, .uni);
+    try std.testing.expectEqual(session_id, core.get_stream_session_id(local_bidi_stream_id).?);
+    try std.testing.expectEqual(session_id, core.get_stream_session_id(local_uni_stream_id).?);
+
+    const preface = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface);
+    const accepted_session_id = try core.accept_session_stream(999, .bidi, preface);
+    try std.testing.expectEqual(session_id, accepted_session_id);
+    try std.testing.expectEqual(session_id, core.get_stream_session_id(999).?);
+}
+
+test "session stream rejects wrong session and bad preface" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = false,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    _ = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const bad_preface = [_]u8{ 0x01, 0x02 };
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.accept_session_stream(700, .uni, &bad_preface));
+
+    const unknown_session_preface = [_]u8{0x05};
+    try std.testing.expectError(errors.FluxError.invalid_argument, core.accept_session_stream(701, .uni, &unknown_session_preface));
+}
+
+test "session close removes associated streams" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+    const stream_id = try core.open_session_stream(session_id, .bidi);
+    try std.testing.expect(core.get_stream_session_id(stream_id) != null);
+
+    try core.begin_close_session(session_id);
+    _ = core.next_session_event();
+    try core.complete_close_session(session_id);
+    _ = core.next_session_event();
+
+    try std.testing.expect(core.get_stream_session_id(stream_id) == null);
 }
 
 test "negotiation fallback chooses capsule-only when datagram disabled" {
