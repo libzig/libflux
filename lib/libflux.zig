@@ -4,6 +4,7 @@ pub const transport_harness = @import("transport_harness.zig");
 pub const h3_core = @import("h3_core.zig");
 pub const h3_control_reader = @import("h3_control_reader.zig");
 pub const h3_control_writer = @import("h3_control_writer.zig");
+pub const h3_framing = @import("h3_framing.zig");
 pub const qpack = @import("qpack.zig");
 pub const wt_core = @import("wt_core.zig");
 pub const public_api = @import("public_api.zig");
