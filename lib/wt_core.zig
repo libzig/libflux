@@ -1,6 +1,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const transport_adapter = @import("transport_adapter.zig");
+const h3_core = @import("h3_core.zig");
 
 pub const MAX_WT_DATAGRAM_PAYLOAD = 1150;
 
@@ -13,6 +14,21 @@ pub const SessionDatagram = struct {
     session_id: u64,
     context_id: u64,
     payload: []u8,
+};
+
+pub const H3Setting = struct {
+    id: u64,
+    value: u64,
+};
+
+pub const WebTransportConnectRequest = struct {
+    authority: []const u8,
+    path: []const u8,
+    origin: []const u8,
+};
+
+pub const WebTransportConnectResponse = struct {
+    status: u16,
 };
 
 pub const NegotiatedFeatures = struct {
@@ -74,6 +90,14 @@ pub const Negotiator = struct {
     pub fn set_peer_webtransport(self: *Negotiator, enabled: bool, max_sessions: u64) void {
         self.peer.webtransport_enabled = enabled;
         self.peer.webtransport_max_sessions = max_sessions;
+    }
+
+    pub fn apply_local_h3_settings(self: *Negotiator, settings: []const H3Setting) errors.FluxError!void {
+        try apply_h3_settings_to_features(settings, &self.local);
+    }
+
+    pub fn apply_peer_h3_settings(self: *Negotiator, settings: []const H3Setting) errors.FluxError!void {
+        try apply_h3_settings_to_features(settings, &self.peer);
     }
 
     pub fn negotiate(self: *Negotiator) NegotiatedFeatures {
@@ -226,6 +250,114 @@ pub const Core = struct {
     pub fn free_session_datagram(self: *Core, datagram: SessionDatagram) void {
         self.allocator.free(datagram.payload);
     }
+
+    pub fn encode_connect_request(self: *Core, request: WebTransportConnectRequest) errors.FluxError![]u8 {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            ":method=CONNECT\n:protocol=webtransport\n:scheme=https\n:authority={s}\n:path={s}\norigin={s}\n",
+            .{ request.authority, request.path, request.origin },
+        ) catch {
+            return errors.FluxError.internal_failure;
+        };
+    }
+
+    pub fn validate_connect_request(self: *Core, encoded: []const u8) errors.FluxError!WebTransportConnectRequest {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var method: ?[]const u8 = null;
+        var protocol: ?[]const u8 = null;
+        var scheme: ?[]const u8 = null;
+        var authority: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var origin: ?[]const u8 = null;
+
+        var lines = std.mem.splitScalar(u8, encoded, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, ":method=")) method = line[8..];
+            if (std.mem.startsWith(u8, line, ":protocol=")) protocol = line[10..];
+            if (std.mem.startsWith(u8, line, ":scheme=")) scheme = line[8..];
+            if (std.mem.startsWith(u8, line, ":authority=")) authority = line[11..];
+            if (std.mem.startsWith(u8, line, ":path=")) path = line[6..];
+            if (std.mem.startsWith(u8, line, "origin=")) origin = line[7..];
+        }
+
+        if (method == null or protocol == null or scheme == null or authority == null or path == null or origin == null) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (!std.mem.eql(u8, method.?, "CONNECT")) return errors.FluxError.protocol_violation;
+        if (!std.mem.eql(u8, protocol.?, "webtransport")) return errors.FluxError.protocol_violation;
+        if (!std.mem.eql(u8, scheme.?, "https")) return errors.FluxError.protocol_violation;
+        if (authority.?.len == 0 or path.?.len == 0 or origin.?.len == 0) return errors.FluxError.protocol_violation;
+
+        const authority_owned = self.allocator.dupe(u8, authority.?) catch return errors.FluxError.internal_failure;
+        errdefer self.allocator.free(authority_owned);
+        const path_owned = self.allocator.dupe(u8, path.?) catch return errors.FluxError.internal_failure;
+        errdefer self.allocator.free(path_owned);
+        const origin_owned = self.allocator.dupe(u8, origin.?) catch return errors.FluxError.internal_failure;
+
+        return .{
+            .authority = authority_owned,
+            .path = path_owned,
+            .origin = origin_owned,
+        };
+    }
+
+    pub fn free_connect_request(self: *Core, request: WebTransportConnectRequest) void {
+        self.allocator.free(request.authority);
+        self.allocator.free(request.path);
+        self.allocator.free(request.origin);
+    }
+
+    pub fn encode_connect_response(self: *Core, response: WebTransportConnectResponse) errors.FluxError![]u8 {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        return std.fmt.allocPrint(self.allocator, ":status={d}\nsec-webtransport-http3-draft=draft02\n", .{response.status}) catch {
+            return errors.FluxError.internal_failure;
+        };
+    }
+
+    pub fn validate_connect_response(self: *Core, encoded: []const u8) errors.FluxError!WebTransportConnectResponse {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var status: ?u16 = null;
+        var draft: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, encoded, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, ":status=")) {
+                status = std.fmt.parseInt(u16, line[8..], 10) catch return errors.FluxError.protocol_violation;
+            }
+            if (std.mem.startsWith(u8, line, "sec-webtransport-http3-draft=")) {
+                draft = line[29..];
+            }
+        }
+
+        if (status == null or draft == null) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (!std.mem.eql(u8, draft.?, "draft02")) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (status.? != 200) {
+            return errors.FluxError.request_rejected;
+        }
+
+        return .{ .status = status.? };
+    }
 };
 
 const VarInt = struct {
@@ -272,6 +404,41 @@ fn decode_varint(data: []const u8) ?VarInt {
     }
 
     return .{ .value = value, .consumed = len };
+}
+
+fn apply_h3_settings_to_features(settings: []const H3Setting, out: *NegotiatedFeatures) errors.FluxError!void {
+    for (settings, 0..) |setting, i| {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (settings[j].id == setting.id) {
+                return errors.FluxError.settings_error;
+            }
+        }
+
+        switch (setting.id) {
+            @intFromEnum(h3_core.H3SettingId.enable_connect_protocol) => {
+                if (setting.value > 1) return errors.FluxError.settings_error;
+                out.connect_protocol_enabled = setting.value == 1;
+            },
+            @intFromEnum(h3_core.H3SettingId.h3_datagram) => {
+                if (setting.value > 1) return errors.FluxError.settings_error;
+                out.h3_datagram_enabled = setting.value == 1;
+            },
+            @intFromEnum(h3_core.H3SettingId.enable_webtransport) => {
+                if (setting.value > 1) return errors.FluxError.settings_error;
+                out.webtransport_enabled = setting.value == 1;
+            },
+            @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions) => {
+                if (setting.value == 0) return errors.FluxError.settings_error;
+                out.webtransport_max_sessions = setting.value;
+            },
+            else => {},
+        }
+    }
+
+    if (out.webtransport_enabled and out.webtransport_max_sessions == 0) {
+        return errors.FluxError.settings_error;
+    }
 }
 
 test "wt core tracks session count under negotiated limits" {
@@ -345,6 +512,55 @@ test "opening session without negotiated webtransport fails" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
     try std.testing.expectError(errors.FluxError.invalid_state, core.open_session());
+}
+
+test "settings parser maps wt related ids into negotiator" {
+    var n = Negotiator.init();
+
+    try n.apply_local_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.h3_datagram), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 8 },
+    });
+
+    try n.apply_peer_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 3 },
+    });
+
+    const features = n.negotiate();
+    try std.testing.expect(features.supports_webtransport());
+    try std.testing.expect(!features.supports_webtransport_datagrams());
+    try std.testing.expectEqual(@as(u64, 3), features.webtransport_max_sessions);
+}
+
+test "settings parser rejects duplicate and invalid boolean values" {
+    var n = Negotiator.init();
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_local_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+    }));
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_peer_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 2 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 4 },
+    }));
+}
+
+test "settings parser requires nonzero max sessions for enabled wt" {
+    var n = Negotiator.init();
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_local_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 0 },
+    }));
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_peer_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+    }));
 }
 
 test "session datagram routing validates context and payload bounds" {
@@ -429,4 +645,81 @@ test "session datagram receive rejects unknown session" {
 
     try adapter.inject_datagram_received(wire.items);
     try std.testing.expectError(errors.FluxError.invalid_argument, core.recv_session_datagram(&adapter));
+}
+
+test "webtransport connect handshake round trip succeeds" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 4,
+    });
+
+    const req_encoded = try core.encode_connect_request(.{
+        .authority = "example.test",
+        .path = "/wt",
+        .origin = "https://example.test",
+    });
+    defer std.testing.allocator.free(req_encoded);
+
+    const parsed_req = try core.validate_connect_request(req_encoded);
+    defer core.free_connect_request(parsed_req);
+    try std.testing.expectEqualStrings("example.test", parsed_req.authority);
+    try std.testing.expectEqualStrings("/wt", parsed_req.path);
+
+    const rsp_encoded = try core.encode_connect_response(.{ .status = 200 });
+    defer std.testing.allocator.free(rsp_encoded);
+    const parsed_rsp = try core.validate_connect_response(rsp_encoded);
+    try std.testing.expectEqual(@as(u16, 200), parsed_rsp.status);
+}
+
+test "webtransport connect request rejects missing pseudo headers" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = false,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const missing_protocol = ":method=CONNECT\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n";
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.validate_connect_request(missing_protocol));
+
+    const invalid_method = ":method=GET\n:protocol=webtransport\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n";
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.validate_connect_request(invalid_method));
+}
+
+test "webtransport connect response handles rejection and bad draft" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const rejected = ":status=403\nsec-webtransport-http3-draft=draft02\n";
+    try std.testing.expectError(errors.FluxError.request_rejected, core.validate_connect_response(rejected));
+
+    const bad_draft = ":status=200\nsec-webtransport-http3-draft=draft01\n";
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.validate_connect_response(bad_draft));
+}
+
+test "webtransport connect handshake requires negotiated settings" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    try std.testing.expectError(errors.FluxError.invalid_state, core.encode_connect_request(.{
+        .authority = "example.test",
+        .path = "/wt",
+        .origin = "https://example.test",
+    }));
+
+    try std.testing.expectError(errors.FluxError.invalid_state, core.validate_connect_request(
+        ":method=CONNECT\n:protocol=webtransport\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n",
+    ));
 }
