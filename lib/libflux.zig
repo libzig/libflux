@@ -25,7 +25,7 @@ pub const Runtime = struct {
             .adapter = transport_adapter.Adapter.init(allocator),
             .h3 = h3_core.Core.init(),
             .qpack_engine = qpack.Engine.init(),
-            .wt = wt_core.Core.init(),
+            .wt = wt_core.Core.init(allocator),
             .api = public_api.Surface.init(),
         };
     }
