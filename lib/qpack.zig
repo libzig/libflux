@@ -12,6 +12,118 @@ const StaticEntry = struct {
     value: []const u8,
 };
 
+pub const DynamicEntry = struct {
+    insert_count: u64,
+    name: []u8,
+    value: []u8,
+    size: usize,
+};
+
+pub const DynamicTable = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(DynamicEntry),
+    max_capacity: usize,
+    current_size: usize,
+    next_insert_count: u64,
+
+    pub fn init(allocator: std.mem.Allocator, max_capacity: usize) DynamicTable {
+        return .{
+            .allocator = allocator,
+            .entries = .{},
+            .max_capacity = max_capacity,
+            .current_size = 0,
+            .next_insert_count = 1,
+        };
+    }
+
+    pub fn deinit(self: *DynamicTable) void {
+        for (self.entries.items) |entry| {
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.value);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    pub fn set_capacity(self: *DynamicTable, capacity: usize) errors.FluxError!void {
+        self.max_capacity = capacity;
+        try self.evict_to_capacity();
+    }
+
+    pub fn insert(self: *DynamicTable, name: []const u8, value: []const u8) errors.FluxError!u64 {
+        const entry_size = name.len + value.len + 32;
+        if (entry_size > self.max_capacity) {
+            try self.clear_all();
+            return errors.FluxError.backpressure;
+        }
+
+        const name_owned = self.allocator.dupe(u8, name) catch return errors.FluxError.internal_failure;
+        errdefer self.allocator.free(name_owned);
+        const value_owned = self.allocator.dupe(u8, value) catch return errors.FluxError.internal_failure;
+        errdefer self.allocator.free(value_owned);
+
+        const insert_count = self.next_insert_count;
+        self.next_insert_count += 1;
+
+        self.entries.insert(self.allocator, 0, .{
+            .insert_count = insert_count,
+            .name = name_owned,
+            .value = value_owned,
+            .size = entry_size,
+        }) catch {
+            return errors.FluxError.internal_failure;
+        };
+        self.current_size += entry_size;
+
+        try self.evict_to_capacity();
+        return insert_count;
+    }
+
+    pub fn find_insert_count(self: *const DynamicTable, name: []const u8, value: []const u8) ?u64 {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name) and std.mem.eql(u8, entry.value, value)) {
+                return entry.insert_count;
+            }
+        }
+        return null;
+    }
+
+    pub fn get_by_insert_count(self: *const DynamicTable, insert_count: u64) ?HeaderField {
+        for (self.entries.items) |entry| {
+            if (entry.insert_count == insert_count) {
+                return .{ .name = entry.name, .value = entry.value };
+            }
+        }
+        return null;
+    }
+
+    fn evict_to_capacity(self: *DynamicTable) errors.FluxError!void {
+        while (self.current_size > self.max_capacity and self.entries.items.len > 0) {
+            const idx = self.entries.items.len - 1;
+            const entry = self.entries.swapRemove(idx);
+            self.current_size -= entry.size;
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.value);
+        }
+
+        if (self.current_size > self.max_capacity) {
+            return errors.FluxError.backpressure;
+        }
+    }
+
+    fn clear_all(self: *DynamicTable) errors.FluxError!void {
+        while (self.entries.items.len > 0) {
+            const entry = self.entries.pop().?;
+            self.current_size -= entry.size;
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.value);
+        }
+
+        if (self.current_size != 0) {
+            return errors.FluxError.internal_failure;
+        }
+    }
+};
+
 // Minimal static table subset required for early HTTP/3 request/response flows.
 const STATIC_TABLE = [_]StaticEntry{
     .{ .index = 17, .name = ":method", .value = "GET" },
@@ -351,6 +463,91 @@ pub const Engine = struct {
         };
     }
 
+    pub fn encode_with_dynamic(self: *const Engine, allocator: std.mem.Allocator, table: *const DynamicTable, headers: []const HeaderField) errors.FluxError![]u8 {
+        _ = self;
+
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(allocator);
+
+        for (headers) |header| {
+            if (table.find_insert_count(header.name, header.value)) |insert_count| {
+                try write_dynamic_line(allocator, &out, insert_count);
+            } else if (find_static_index(header.name, header.value)) |idx| {
+                try write_indexed_line(allocator, &out, idx);
+            } else {
+                try write_literal_line(allocator, &out, header.name, header.value);
+            }
+        }
+
+        return out.toOwnedSlice(allocator) catch {
+            return errors.FluxError.internal_failure;
+        };
+    }
+
+    pub fn decode_with_dynamic(self: *const Engine, allocator: std.mem.Allocator, table: *const DynamicTable, encoded: []const u8) errors.FluxError![]HeaderField {
+        _ = self;
+
+        var fields: std.ArrayList(HeaderField) = .{};
+        defer {
+            for (fields.items) |field| {
+                allocator.free(field.name);
+                allocator.free(field.value);
+            }
+            fields.deinit(allocator);
+        }
+
+        var lines = std.mem.splitScalar(u8, encoded, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            if (std.mem.startsWith(u8, line, "d:")) {
+                const insert_count = std.fmt.parseInt(u64, line[2..], 10) catch return errors.FluxError.protocol_violation;
+                const entry = table.get_by_insert_count(insert_count) orelse return errors.FluxError.protocol_violation;
+
+                const name = allocator.dupe(u8, entry.name) catch return errors.FluxError.internal_failure;
+                errdefer allocator.free(name);
+                const value = allocator.dupe(u8, entry.value) catch return errors.FluxError.internal_failure;
+                errdefer allocator.free(value);
+
+                fields.append(allocator, .{ .name = name, .value = value }) catch return errors.FluxError.internal_failure;
+                continue;
+            }
+
+            if (std.mem.startsWith(u8, line, "s:")) {
+                const index = std.fmt.parseInt(u16, line[2..], 10) catch return errors.FluxError.protocol_violation;
+                const entry = find_static_entry(index) orelse return errors.FluxError.protocol_violation;
+
+                const name = allocator.dupe(u8, entry.name) catch return errors.FluxError.internal_failure;
+                errdefer allocator.free(name);
+                const value = allocator.dupe(u8, entry.value) catch return errors.FluxError.internal_failure;
+                errdefer allocator.free(value);
+
+                fields.append(allocator, .{ .name = name, .value = value }) catch return errors.FluxError.internal_failure;
+                continue;
+            }
+
+            if (std.mem.startsWith(u8, line, "l:")) {
+                const body = line[2..];
+                const separator = std.mem.indexOfScalar(u8, body, '=') orelse return errors.FluxError.protocol_violation;
+                const name_src = body[0..separator];
+                const value_src = body[separator + 1 ..];
+                if (name_src.len == 0) return errors.FluxError.protocol_violation;
+
+                const name = allocator.dupe(u8, name_src) catch return errors.FluxError.internal_failure;
+                errdefer allocator.free(name);
+                const value = allocator.dupe(u8, value_src) catch return errors.FluxError.internal_failure;
+                errdefer allocator.free(value);
+
+                fields.append(allocator, .{ .name = name, .value = value }) catch return errors.FluxError.internal_failure;
+                continue;
+            }
+
+            return errors.FluxError.protocol_violation;
+        }
+
+        return fields.toOwnedSlice(allocator) catch return errors.FluxError.internal_failure;
+    }
+
     pub fn free_decoded_headers(self: *const Engine, allocator: std.mem.Allocator, headers: []HeaderField) void {
         _ = self;
         for (headers) |header| {
@@ -392,6 +589,17 @@ fn write_indexed_line(allocator: std.mem.Allocator, out: *std.ArrayList(u8), ind
 
 fn write_literal_line(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, value: []const u8) errors.FluxError!void {
     const line = std.fmt.allocPrint(allocator, "l:{s}={s}\n", .{ name, value }) catch {
+        return errors.FluxError.internal_failure;
+    };
+    defer allocator.free(line);
+
+    out.appendSlice(allocator, line) catch {
+        return errors.FluxError.internal_failure;
+    };
+}
+
+fn write_dynamic_line(allocator: std.mem.Allocator, out: *std.ArrayList(u8), insert_count: u64) errors.FluxError!void {
+    const line = std.fmt.allocPrint(allocator, "d:{d}\n", .{insert_count}) catch {
         return errors.FluxError.internal_failure;
     };
     defer allocator.free(line);
@@ -508,4 +716,62 @@ test "control sync parses increment cancel and rejects malformed lines" {
 
     try std.testing.expectError(errors.FluxError.protocol_violation, sync.recv_decoder_bytes("ack:7:notnum\n"));
     try std.testing.expectError(errors.FluxError.protocol_violation, sync.recv_decoder_bytes("badline\n"));
+}
+
+test "dynamic table evicts oldest entries at capacity" {
+    var table = DynamicTable.init(std.testing.allocator, 100);
+    defer table.deinit();
+
+    _ = try table.insert("k1", "aaaaaaaaaaaaaaaaaaaa");
+    const second = try table.insert("k2", "bbbbbbbbbbbbbbbbbbbb");
+
+    try std.testing.expect(table.find_insert_count("k1", "aaaaaaaaaaaaaaaaaaaa") == null);
+    try std.testing.expectEqual(second, table.find_insert_count("k2", "bbbbbbbbbbbbbbbbbbbb").?);
+}
+
+test "dynamic encode decode uses dynamic references" {
+    const engine = Engine.init();
+
+    var table = DynamicTable.init(std.testing.allocator, 256);
+    defer table.deinit();
+
+    const insert_count = try table.insert(":authority", "example.test");
+    const encoded = try engine.encode_with_dynamic(std.testing.allocator, &table, &.{
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = ":method", .value = "GET" },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "d:{d}\n", .{insert_count});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, expected) != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "s:17\n") != null);
+
+    const decoded = try engine.decode_with_dynamic(std.testing.allocator, &table, encoded);
+    defer engine.free_decoded_headers(std.testing.allocator, decoded);
+    try std.testing.expectEqualStrings(":authority", decoded[0].name);
+    try std.testing.expectEqualStrings("example.test", decoded[0].value);
+    try std.testing.expectEqualStrings(":method", decoded[1].name);
+    try std.testing.expectEqualStrings("GET", decoded[1].value);
+}
+
+test "blocked stream release after acked insert count update" {
+    var sync = ControlSync.init(std.testing.allocator);
+    defer sync.deinit();
+
+    _ = try sync.queue_insert_instruction("x-a", "1");
+    _ = try sync.queue_insert_instruction("x-b", "2");
+    _ = try sync.queue_insert_instruction("x-c", "3");
+
+    try sync.mark_stream_blocked(101, 2);
+    try sync.mark_stream_blocked(102, 3);
+    try std.testing.expect(sync.is_stream_blocked(101));
+    try std.testing.expect(sync.is_stream_blocked(102));
+
+    try sync.recv_decoder_bytes("ack:1:2\n");
+    try std.testing.expect(!sync.is_stream_blocked(101));
+    try std.testing.expect(sync.is_stream_blocked(102));
+
+    try sync.recv_decoder_bytes("inc:1\n");
+    try std.testing.expect(!sync.is_stream_blocked(102));
 }
