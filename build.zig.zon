@@ -1,0 +1,18 @@
+.{
+    .name = .libflux,
+    .version = "0.0.1",
+    .dependencies = .{
+        .libfast = .{
+            .url = "https://github.com/bresilla/libfast/archive/refs/tags/0.0.13.tar.gz",
+            .hash = "libfast-0.0.13-Gf9gLltPDwD7C660dH8kyu2CgmGOW1cSc612ORoCI9il",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "bin",
+        "examples",
+        "lib",
+    },
+    .fingerprint = 0x4e656d76eca6c94f,
+}
