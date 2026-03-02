@@ -8,6 +8,7 @@ pub const h3_framing = @import("h3_framing.zig");
 pub const h3_transaction = @import("h3_transaction.zig");
 pub const qpack = @import("qpack.zig");
 pub const wt_core = @import("wt_core.zig");
+pub const wt_capsule = @import("wt_capsule.zig");
 pub const public_api = @import("public_api.zig");
 pub const errors = @import("errors.zig");
 
