@@ -4,6 +4,7 @@ const transport_adapter = @import("transport_adapter.zig");
 const h3_core = @import("h3_core.zig");
 
 pub const MAX_WT_DATAGRAM_PAYLOAD = 1150;
+pub const MAX_INFLIGHT_WT_DATAGRAMS = 4;
 
 pub const TransportPreference = enum {
     datagram,
@@ -154,6 +155,7 @@ pub const Core = struct {
     next_session_id: u64,
     active_sessions: std.AutoHashMap(u64, SessionInfo),
     session_events: std.ArrayList(SessionEvent),
+    session_inflight_datagrams: std.AutoHashMap(u64, usize),
     next_stream_id: u64,
     active_streams: std.AutoHashMap(u64, SessionStream),
 
@@ -165,6 +167,7 @@ pub const Core = struct {
             .next_session_id = 1,
             .active_sessions = std.AutoHashMap(u64, SessionInfo).init(allocator),
             .session_events = .{},
+            .session_inflight_datagrams = std.AutoHashMap(u64, usize).init(allocator),
             .next_stream_id = 1,
             .active_streams = std.AutoHashMap(u64, SessionStream).init(allocator),
         };
@@ -172,6 +175,7 @@ pub const Core = struct {
 
     pub fn deinit(self: *Core) void {
         self.active_streams.deinit();
+        self.session_inflight_datagrams.deinit();
         self.active_sessions.deinit();
         self.session_events.deinit(self.allocator);
     }
@@ -213,6 +217,10 @@ pub const Core = struct {
         self.active_sessions.put(session_id, info) catch {
             return errors.FluxError.internal_failure;
         };
+        self.session_inflight_datagrams.put(session_id, 0) catch {
+            _ = self.active_sessions.remove(session_id);
+            return errors.FluxError.internal_failure;
+        };
         self.sessions_open += 1;
         try self.push_session_event(.{ .opened = info });
         return session_id;
@@ -238,6 +246,10 @@ pub const Core = struct {
         };
 
         self.active_sessions.put(session_id, info) catch {
+            return errors.FluxError.internal_failure;
+        };
+        self.session_inflight_datagrams.put(session_id, 0) catch {
+            _ = self.active_sessions.remove(session_id);
             return errors.FluxError.internal_failure;
         };
         self.sessions_open += 1;
@@ -283,6 +295,7 @@ pub const Core = struct {
         }
 
         _ = self.active_sessions.remove(session_id);
+        _ = self.session_inflight_datagrams.remove(session_id);
         if (self.sessions_open > 0) {
             self.sessions_open -= 1;
         }
@@ -397,6 +410,11 @@ pub const Core = struct {
             return errors.FluxError.invalid_argument;
         }
 
+        const in_flight = self.session_inflight_datagrams.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (in_flight >= MAX_INFLIGHT_WT_DATAGRAMS) {
+            return errors.FluxError.backpressure;
+        }
+
         if (payload.len == 0 or payload.len > MAX_WT_DATAGRAM_PAYLOAD) {
             return errors.FluxError.invalid_argument;
         }
@@ -410,7 +428,15 @@ pub const Core = struct {
             return errors.FluxError.internal_failure;
         };
 
-        return adapter.send_datagram(wire.items);
+        const sent = try adapter.send_datagram(wire.items);
+        self.session_inflight_datagrams.put(session_id, in_flight + 1) catch return errors.FluxError.internal_failure;
+        return sent;
+    }
+
+    pub fn acknowledge_session_datagram_send(self: *Core, session_id: u64, count: usize) errors.FluxError!void {
+        const in_flight = self.session_inflight_datagrams.get(session_id) orelse return errors.FluxError.invalid_argument;
+        const dec = @min(count, in_flight);
+        self.session_inflight_datagrams.put(session_id, in_flight - dec) catch return errors.FluxError.internal_failure;
     }
 
     pub fn recv_session_datagram(self: *Core, adapter: *transport_adapter.Adapter) errors.FluxError!SessionDatagram {
@@ -436,7 +462,7 @@ pub const Core = struct {
 
         const info = self.active_sessions.get(sid_vi.value) orelse return errors.FluxError.invalid_argument;
         if (info.state != .active) {
-            return errors.FluxError.invalid_argument;
+            return errors.FluxError.stream_closed;
         }
 
         const body = payload[body_offset..];
@@ -976,6 +1002,65 @@ test "session datagram receive rejects unknown session" {
 
     try adapter.inject_datagram_received(wire.items);
     try std.testing.expectError(errors.FluxError.invalid_argument, core.recv_session_datagram(&adapter));
+}
+
+test "session datagram send applies backpressure and recovers on ack" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+    adapter.set_datagram_enabled(true);
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 1,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    var i: usize = 0;
+    while (i < MAX_INFLIGHT_WT_DATAGRAMS) : (i += 1) {
+        _ = try core.send_session_datagram(&adapter, session_id, 1, "d");
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+    }
+
+    try std.testing.expectError(errors.FluxError.backpressure, core.send_session_datagram(&adapter, session_id, 1, "d"));
+
+    try core.acknowledge_session_datagram_send(session_id, 1);
+    _ = try core.send_session_datagram(&adapter, session_id, 1, "d");
+}
+
+test "late datagram is rejected when session starts closing" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+    adapter.set_datagram_enabled(true);
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 1,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+    try core.begin_close_session(session_id);
+    _ = core.next_session_event();
+
+    var wire: std.ArrayList(u8) = .{};
+    defer wire.deinit(std.testing.allocator);
+    try append_varint(std.testing.allocator, &wire, session_id);
+    try append_varint(std.testing.allocator, &wire, 5);
+    try wire.appendSlice(std.testing.allocator, "late");
+
+    try adapter.inject_datagram_received(wire.items);
+    try std.testing.expectError(errors.FluxError.stream_closed, core.recv_session_datagram(&adapter));
 }
 
 test "webtransport connect handshake round trip succeeds" {
