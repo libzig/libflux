@@ -60,6 +60,8 @@ pub const StreamKind = enum {
 pub const StreamState = enum {
     open,
     closed,
+    reset,
+    stop_sending,
 };
 
 pub const SessionStream = struct {
@@ -398,6 +400,53 @@ pub const Core = struct {
         var closed_stream = stream;
         closed_stream.state = .closed;
         self.active_streams.put(stream_id, closed_stream) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn reset_session_stream(self: *Core, stream_id: u64) errors.FluxError!void {
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state == .closed or stream.state == .reset or stream.state == .stop_sending) {
+            return;
+        }
+
+        var updated = stream;
+        updated.state = .reset;
+        self.active_streams.put(stream_id, updated) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn stop_sending_session_stream(self: *Core, stream_id: u64) errors.FluxError!void {
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state == .closed or stream.state == .reset or stream.state == .stop_sending) {
+            return;
+        }
+
+        var updated = stream;
+        updated.state = .stop_sending;
+        self.active_streams.put(stream_id, updated) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn send_stream_data_partial(
+        self: *Core,
+        adapter: *transport_adapter.Adapter,
+        stream_id: u64,
+        data: []const u8,
+        max_chunk_size: usize,
+    ) errors.FluxError!usize {
+        if (max_chunk_size == 0) {
+            return errors.FluxError.invalid_argument;
+        }
+
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state != .open) {
+            return errors.FluxError.stream_closed;
+        }
+
+        const session = self.active_sessions.get(stream.session_id) orelse return errors.FluxError.invalid_argument;
+        if (session.state != .active) {
+            return errors.FluxError.stream_closed;
+        }
+
+        const to_send = @min(max_chunk_size, data.len);
+        return adapter.send_stream_data(stream_id, data[0..to_send]);
     }
 
     pub fn send_session_datagram(self: *Core, adapter: *transport_adapter.Adapter, session_id: u64, context_id: u64, payload: []const u8) errors.FluxError!usize {
@@ -842,6 +891,92 @@ test "session close removes associated streams" {
     _ = core.next_session_event();
 
     try std.testing.expect(core.get_stream_session_id(stream_id) == null);
+}
+
+test "session stream partial writes are deterministic" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const adapter_stream_id = try adapter.open_stream(true);
+    _ = adapter.next_event(); // consume stream_opened
+
+    const preface = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface);
+    _ = try core.accept_session_stream(adapter_stream_id, .bidi, preface);
+
+    const payload = "abcdef";
+    const n1 = try core.send_stream_data_partial(&adapter, adapter_stream_id, payload, 2);
+    const n2 = try core.send_stream_data_partial(&adapter, adapter_stream_id, payload[n1..], 2);
+    const n3 = try core.send_stream_data_partial(&adapter, adapter_stream_id, payload[n1 + n2 ..], 10);
+    try std.testing.expectEqual(@as(usize, 2), n1);
+    try std.testing.expectEqual(@as(usize, 2), n2);
+    try std.testing.expectEqual(@as(usize, 2), n3);
+
+    {
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+        try std.testing.expectEqual(transport_adapter.EventKind.stream_data, e.kind);
+        try std.testing.expectEqualStrings("ab", e.payload.?);
+    }
+    {
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+        try std.testing.expectEqual(transport_adapter.EventKind.stream_data, e.kind);
+        try std.testing.expectEqualStrings("cd", e.payload.?);
+    }
+    {
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+        try std.testing.expectEqual(transport_adapter.EventKind.stream_data, e.kind);
+        try std.testing.expectEqualStrings("ef", e.payload.?);
+    }
+}
+
+test "reset and stop-sending block further stream writes" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const stream_a = try adapter.open_stream(true);
+    _ = adapter.next_event();
+    const preface_a = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface_a);
+    _ = try core.accept_session_stream(stream_a, .bidi, preface_a);
+
+    try core.reset_session_stream(stream_a);
+    try std.testing.expectError(errors.FluxError.stream_closed, core.send_stream_data_partial(&adapter, stream_a, "x", 1));
+
+    const stream_b = try adapter.open_stream(true);
+    _ = adapter.next_event();
+    const preface_b = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface_b);
+    _ = try core.accept_session_stream(stream_b, .uni, preface_b);
+
+    try core.stop_sending_session_stream(stream_b);
+    try std.testing.expectError(errors.FluxError.stream_closed, core.send_stream_data_partial(&adapter, stream_b, "x", 1));
 }
 
 test "negotiation fallback chooses capsule-only when datagram disabled" {
