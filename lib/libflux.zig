@@ -25,6 +25,12 @@ pub const Runtime = struct {
             .api = public_api.Surface.init(),
         };
     }
+
+    pub fn start_with_alpn(self: *Runtime, negotiated_alpn: []const u8) errors.FluxError!void {
+        try self.h3.validate_alpn(negotiated_alpn);
+        try self.h3.mark_ready();
+        try self.api.start(self.h3.ready);
+    }
 };
 
 pub fn version() []const u8 {
@@ -42,4 +48,26 @@ test "runtime scaffold initializes" {
     const runtime = Runtime.init(arena.allocator());
     try std.testing.expect(runtime.h3.ready == false);
     try std.testing.expect(runtime.api.started == false);
+}
+
+test "runtime starts only with h3 alpn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = Runtime.init(arena.allocator());
+    try std.testing.expectError(errors.FluxError.invalid_state, runtime.start_with_alpn("hq-29"));
+    try std.testing.expect(!runtime.api.started);
+
+    try runtime.start_with_alpn("h3");
+    try std.testing.expect(runtime.h3.ready);
+    try std.testing.expect(runtime.api.started);
+}
+
+test "runtime rejects late start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var runtime = Runtime.init(arena.allocator());
+    try runtime.start_with_alpn("h3");
+    try std.testing.expectError(errors.FluxError.invalid_state, runtime.start_with_alpn("h3"));
 }

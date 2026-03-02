@@ -9,6 +9,10 @@ pub const Surface = struct {
     }
 
     pub fn start(self: *Surface, h3_ready: bool) errors.FluxError!void {
+        if (self.started) {
+            return errors.FluxError.invalid_state;
+        }
+
         if (!h3_ready) {
             return errors.FluxError.invalid_state;
         }
@@ -23,4 +27,10 @@ test "public api requires ready h3" {
 
     try surface.start(true);
     try std.testing.expect(surface.started);
+}
+
+test "public api rejects late restart" {
+    var surface = Surface.init();
+    try surface.start(true);
+    try std.testing.expectError(errors.FluxError.invalid_state, surface.start(true));
 }
