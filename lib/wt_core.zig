@@ -1,8 +1,10 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const transport_adapter = @import("transport_adapter.zig");
+const h3_core = @import("h3_core.zig");
 
 pub const MAX_WT_DATAGRAM_PAYLOAD = 1150;
+pub const MAX_INFLIGHT_WT_DATAGRAMS = 4;
 
 pub const TransportPreference = enum {
     datagram,
@@ -13,6 +15,60 @@ pub const SessionDatagram = struct {
     session_id: u64,
     context_id: u64,
     payload: []u8,
+};
+
+pub const H3Setting = struct {
+    id: u64,
+    value: u64,
+};
+
+pub const WebTransportConnectRequest = struct {
+    authority: []const u8,
+    path: []const u8,
+    origin: []const u8,
+};
+
+pub const WebTransportConnectResponse = struct {
+    status: u16,
+};
+
+pub const SessionState = enum {
+    active,
+    closing,
+    closed,
+    errored,
+};
+
+pub const SessionInfo = struct {
+    session_id: u64,
+    stream_id: u64,
+    state: SessionState,
+};
+
+pub const SessionEvent = union(enum) {
+    opened: SessionInfo,
+    closing: SessionInfo,
+    closed: SessionInfo,
+    errored: SessionInfo,
+};
+
+pub const StreamKind = enum {
+    bidi,
+    uni,
+};
+
+pub const StreamState = enum {
+    open,
+    closed,
+    reset,
+    stop_sending,
+};
+
+pub const SessionStream = struct {
+    stream_id: u64,
+    session_id: u64,
+    kind: StreamKind,
+    state: StreamState,
 };
 
 pub const NegotiatedFeatures = struct {
@@ -76,6 +132,14 @@ pub const Negotiator = struct {
         self.peer.webtransport_max_sessions = max_sessions;
     }
 
+    pub fn apply_local_h3_settings(self: *Negotiator, settings: []const H3Setting) errors.FluxError!void {
+        try apply_h3_settings_to_features(settings, &self.local);
+    }
+
+    pub fn apply_peer_h3_settings(self: *Negotiator, settings: []const H3Setting) errors.FluxError!void {
+        try apply_h3_settings_to_features(settings, &self.peer);
+    }
+
     pub fn negotiate(self: *Negotiator) NegotiatedFeatures {
         return .{
             .connect_protocol_enabled = self.local.connect_protocol_enabled and self.peer.connect_protocol_enabled,
@@ -91,7 +155,11 @@ pub const Core = struct {
     sessions_open: usize,
     negotiated: NegotiatedFeatures,
     next_session_id: u64,
-    active_sessions: std.AutoHashMap(u64, void),
+    active_sessions: std.AutoHashMap(u64, SessionInfo),
+    session_events: std.ArrayList(SessionEvent),
+    session_inflight_datagrams: std.AutoHashMap(u64, usize),
+    next_stream_id: u64,
+    active_streams: std.AutoHashMap(u64, SessionStream),
 
     pub fn init(allocator: std.mem.Allocator) Core {
         return .{
@@ -99,12 +167,19 @@ pub const Core = struct {
             .sessions_open = 0,
             .negotiated = NegotiatedFeatures.init(),
             .next_session_id = 1,
-            .active_sessions = std.AutoHashMap(u64, void).init(allocator),
+            .active_sessions = std.AutoHashMap(u64, SessionInfo).init(allocator),
+            .session_events = .{},
+            .session_inflight_datagrams = std.AutoHashMap(u64, usize).init(allocator),
+            .next_stream_id = 1,
+            .active_streams = std.AutoHashMap(u64, SessionStream).init(allocator),
         };
     }
 
     pub fn deinit(self: *Core) void {
+        self.active_streams.deinit();
+        self.session_inflight_datagrams.deinit();
         self.active_sessions.deinit();
+        self.session_events.deinit(self.allocator);
     }
 
     pub fn apply_negotiated_features(self: *Core, features: NegotiatedFeatures) void {
@@ -135,26 +210,243 @@ pub const Core = struct {
         const session_id = self.next_session_id;
         self.next_session_id += 1;
 
-        self.active_sessions.put(session_id, {}) catch {
+        const info = SessionInfo{
+            .session_id = session_id,
+            .stream_id = 0,
+            .state = .active,
+        };
+
+        self.active_sessions.put(session_id, info) catch {
+            return errors.FluxError.internal_failure;
+        };
+        self.session_inflight_datagrams.put(session_id, 0) catch {
+            _ = self.active_sessions.remove(session_id);
             return errors.FluxError.internal_failure;
         };
         self.sessions_open += 1;
+        try self.push_session_event(.{ .opened = info });
         return session_id;
+    }
+
+    pub fn register_session_with_id(self: *Core, session_id: u64, stream_id: u64) errors.FluxError!void {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        if (self.active_sessions.contains(session_id)) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (self.sessions_open >= self.negotiated.webtransport_max_sessions) {
+            return errors.FluxError.backpressure;
+        }
+
+        const info = SessionInfo{
+            .session_id = session_id,
+            .stream_id = stream_id,
+            .state = .active,
+        };
+
+        self.active_sessions.put(session_id, info) catch {
+            return errors.FluxError.internal_failure;
+        };
+        self.session_inflight_datagrams.put(session_id, 0) catch {
+            _ = self.active_sessions.remove(session_id);
+            return errors.FluxError.internal_failure;
+        };
+        self.sessions_open += 1;
+        try self.push_session_event(.{ .opened = info });
+    }
+
+    pub fn begin_close_session(self: *Core, session_id: u64) errors.FluxError!void {
+        const info = self.active_sessions.getPtr(session_id) orelse return errors.FluxError.invalid_argument;
+        switch (info.state) {
+            .active => {
+                info.state = .closing;
+                try self.push_session_event(.{ .closing = info.* });
+            },
+            .closing, .closed => {},
+            .errored => return errors.FluxError.invalid_state,
+        }
+    }
+
+    pub fn mark_session_error(self: *Core, session_id: u64) errors.FluxError!void {
+        const info = self.active_sessions.getPtr(session_id) orelse return errors.FluxError.invalid_argument;
+        info.state = .errored;
+        try self.push_session_event(.{ .errored = info.* });
+    }
+
+    pub fn complete_close_session(self: *Core, session_id: u64) errors.FluxError!void {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state == .errored) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var stream_ids_to_remove: std.ArrayList(u64) = .{};
+        defer stream_ids_to_remove.deinit(self.allocator);
+
+        var stream_it = self.active_streams.iterator();
+        while (stream_it.next()) |entry| {
+            if (entry.value_ptr.session_id == session_id) {
+                stream_ids_to_remove.append(self.allocator, entry.key_ptr.*) catch return errors.FluxError.internal_failure;
+            }
+        }
+
+        for (stream_ids_to_remove.items) |stream_id| {
+            _ = self.active_streams.remove(stream_id);
+        }
+
+        _ = self.active_sessions.remove(session_id);
+        _ = self.session_inflight_datagrams.remove(session_id);
+        if (self.sessions_open > 0) {
+            self.sessions_open -= 1;
+        }
+
+        var closed_info = info;
+        closed_info.state = .closed;
+        try self.push_session_event(.{ .closed = closed_info });
     }
 
     pub fn close_session(self: *Core) void {
         if (self.sessions_open == 0) return;
         var it = self.active_sessions.iterator();
         if (it.next()) |entry| {
-            _ = self.active_sessions.remove(entry.key_ptr.*);
+            self.close_session_id(entry.key_ptr.*);
         }
-        self.sessions_open -= 1;
     }
 
     pub fn close_session_id(self: *Core, session_id: u64) void {
-        if (self.active_sessions.remove(session_id)) {
-            self.sessions_open -= 1;
+        self.begin_close_session(session_id) catch return;
+        self.complete_close_session(session_id) catch return;
+    }
+
+    pub fn next_session_event(self: *Core) ?SessionEvent {
+        if (self.session_events.items.len == 0) {
+            return null;
         }
+
+        return self.session_events.orderedRemove(0);
+    }
+
+    pub fn open_session_stream(self: *Core, session_id: u64, kind: StreamKind) errors.FluxError!u64 {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.invalid_state;
+        }
+
+        const stream_id = self.next_stream_id;
+        self.next_stream_id += 1;
+
+        self.active_streams.put(stream_id, .{
+            .stream_id = stream_id,
+            .session_id = session_id,
+            .kind = kind,
+            .state = .open,
+        }) catch return errors.FluxError.internal_failure;
+
+        return stream_id;
+    }
+
+    pub fn encode_stream_preface(self: *Core, session_id: u64) errors.FluxError![]u8 {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+
+        try append_varint(self.allocator, &out, session_id);
+        return out.toOwnedSlice(self.allocator) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn accept_session_stream(self: *Core, stream_id: u64, kind: StreamKind, preface: []const u8) errors.FluxError!u64 {
+        if (self.active_streams.contains(stream_id)) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        const sid = decode_varint(preface) orelse return errors.FluxError.protocol_violation;
+        if (sid.consumed != preface.len) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        const info = self.active_sessions.get(sid.value) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.invalid_state;
+        }
+
+        self.active_streams.put(stream_id, .{
+            .stream_id = stream_id,
+            .session_id = sid.value,
+            .kind = kind,
+            .state = .open,
+        }) catch return errors.FluxError.internal_failure;
+
+        return sid.value;
+    }
+
+    pub fn get_stream_session_id(self: *Core, stream_id: u64) ?u64 {
+        const stream = self.active_streams.get(stream_id) orelse return null;
+        return stream.session_id;
+    }
+
+    pub fn close_session_stream(self: *Core, stream_id: u64) errors.FluxError!void {
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state == .closed) {
+            _ = self.active_streams.remove(stream_id);
+            return;
+        }
+
+        var closed_stream = stream;
+        closed_stream.state = .closed;
+        self.active_streams.put(stream_id, closed_stream) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn reset_session_stream(self: *Core, stream_id: u64) errors.FluxError!void {
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state == .closed or stream.state == .reset or stream.state == .stop_sending) {
+            return;
+        }
+
+        var updated = stream;
+        updated.state = .reset;
+        self.active_streams.put(stream_id, updated) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn stop_sending_session_stream(self: *Core, stream_id: u64) errors.FluxError!void {
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state == .closed or stream.state == .reset or stream.state == .stop_sending) {
+            return;
+        }
+
+        var updated = stream;
+        updated.state = .stop_sending;
+        self.active_streams.put(stream_id, updated) catch return errors.FluxError.internal_failure;
+    }
+
+    pub fn send_stream_data_partial(
+        self: *Core,
+        adapter: *transport_adapter.Adapter,
+        stream_id: u64,
+        data: []const u8,
+        max_chunk_size: usize,
+    ) errors.FluxError!usize {
+        if (max_chunk_size == 0) {
+            return errors.FluxError.invalid_argument;
+        }
+
+        const stream = self.active_streams.get(stream_id) orelse return errors.FluxError.invalid_argument;
+        if (stream.state != .open) {
+            return errors.FluxError.stream_closed;
+        }
+
+        const session = self.active_sessions.get(stream.session_id) orelse return errors.FluxError.invalid_argument;
+        if (session.state != .active) {
+            return errors.FluxError.stream_closed;
+        }
+
+        const to_send = @min(max_chunk_size, data.len);
+        return adapter.send_stream_data(stream_id, data[0..to_send]);
     }
 
     pub fn send_session_datagram(self: *Core, adapter: *transport_adapter.Adapter, session_id: u64, context_id: u64, payload: []const u8) errors.FluxError!usize {
@@ -162,8 +454,14 @@ pub const Core = struct {
             return errors.FluxError.invalid_state;
         }
 
-        if (!self.active_sessions.contains(session_id)) {
+        const info = self.active_sessions.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
             return errors.FluxError.invalid_argument;
+        }
+
+        const in_flight = self.session_inflight_datagrams.get(session_id) orelse return errors.FluxError.invalid_argument;
+        if (in_flight >= MAX_INFLIGHT_WT_DATAGRAMS) {
+            return errors.FluxError.backpressure;
         }
 
         if (payload.len == 0 or payload.len > MAX_WT_DATAGRAM_PAYLOAD) {
@@ -179,7 +477,15 @@ pub const Core = struct {
             return errors.FluxError.internal_failure;
         };
 
-        return adapter.send_datagram(wire.items);
+        const sent = try adapter.send_datagram(wire.items);
+        self.session_inflight_datagrams.put(session_id, in_flight + 1) catch return errors.FluxError.internal_failure;
+        return sent;
+    }
+
+    pub fn acknowledge_session_datagram_send(self: *Core, session_id: u64, count: usize) errors.FluxError!void {
+        const in_flight = self.session_inflight_datagrams.get(session_id) orelse return errors.FluxError.invalid_argument;
+        const dec = @min(count, in_flight);
+        self.session_inflight_datagrams.put(session_id, in_flight - dec) catch return errors.FluxError.internal_failure;
     }
 
     pub fn recv_session_datagram(self: *Core, adapter: *transport_adapter.Adapter) errors.FluxError!SessionDatagram {
@@ -203,8 +509,9 @@ pub const Core = struct {
             return errors.FluxError.protocol_violation;
         }
 
-        if (!self.active_sessions.contains(sid_vi.value)) {
-            return errors.FluxError.invalid_argument;
+        const info = self.active_sessions.get(sid_vi.value) orelse return errors.FluxError.invalid_argument;
+        if (info.state != .active) {
+            return errors.FluxError.stream_closed;
         }
 
         const body = payload[body_offset..];
@@ -225,6 +532,120 @@ pub const Core = struct {
 
     pub fn free_session_datagram(self: *Core, datagram: SessionDatagram) void {
         self.allocator.free(datagram.payload);
+    }
+
+    fn push_session_event(self: *Core, event: SessionEvent) errors.FluxError!void {
+        self.session_events.append(self.allocator, event) catch {
+            return errors.FluxError.internal_failure;
+        };
+    }
+
+    pub fn encode_connect_request(self: *Core, request: WebTransportConnectRequest) errors.FluxError![]u8 {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            ":method=CONNECT\n:protocol=webtransport\n:scheme=https\n:authority={s}\n:path={s}\norigin={s}\n",
+            .{ request.authority, request.path, request.origin },
+        ) catch {
+            return errors.FluxError.internal_failure;
+        };
+    }
+
+    pub fn validate_connect_request(self: *Core, encoded: []const u8) errors.FluxError!WebTransportConnectRequest {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var method: ?[]const u8 = null;
+        var protocol: ?[]const u8 = null;
+        var scheme: ?[]const u8 = null;
+        var authority: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var origin: ?[]const u8 = null;
+
+        var lines = std.mem.splitScalar(u8, encoded, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, ":method=")) method = line[8..];
+            if (std.mem.startsWith(u8, line, ":protocol=")) protocol = line[10..];
+            if (std.mem.startsWith(u8, line, ":scheme=")) scheme = line[8..];
+            if (std.mem.startsWith(u8, line, ":authority=")) authority = line[11..];
+            if (std.mem.startsWith(u8, line, ":path=")) path = line[6..];
+            if (std.mem.startsWith(u8, line, "origin=")) origin = line[7..];
+        }
+
+        if (method == null or protocol == null or scheme == null or authority == null or path == null or origin == null) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (!std.mem.eql(u8, method.?, "CONNECT")) return errors.FluxError.protocol_violation;
+        if (!std.mem.eql(u8, protocol.?, "webtransport")) return errors.FluxError.protocol_violation;
+        if (!std.mem.eql(u8, scheme.?, "https")) return errors.FluxError.protocol_violation;
+        if (authority.?.len == 0 or path.?.len == 0 or origin.?.len == 0) return errors.FluxError.protocol_violation;
+
+        const authority_owned = self.allocator.dupe(u8, authority.?) catch return errors.FluxError.internal_failure;
+        errdefer self.allocator.free(authority_owned);
+        const path_owned = self.allocator.dupe(u8, path.?) catch return errors.FluxError.internal_failure;
+        errdefer self.allocator.free(path_owned);
+        const origin_owned = self.allocator.dupe(u8, origin.?) catch return errors.FluxError.internal_failure;
+
+        return .{
+            .authority = authority_owned,
+            .path = path_owned,
+            .origin = origin_owned,
+        };
+    }
+
+    pub fn free_connect_request(self: *Core, request: WebTransportConnectRequest) void {
+        self.allocator.free(request.authority);
+        self.allocator.free(request.path);
+        self.allocator.free(request.origin);
+    }
+
+    pub fn encode_connect_response(self: *Core, response: WebTransportConnectResponse) errors.FluxError![]u8 {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        return std.fmt.allocPrint(self.allocator, ":status={d}\nsec-webtransport-http3-draft=draft02\n", .{response.status}) catch {
+            return errors.FluxError.internal_failure;
+        };
+    }
+
+    pub fn validate_connect_response(self: *Core, encoded: []const u8) errors.FluxError!WebTransportConnectResponse {
+        if (!self.negotiated.supports_webtransport()) {
+            return errors.FluxError.invalid_state;
+        }
+
+        var status: ?u16 = null;
+        var draft: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, encoded, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, ":status=")) {
+                status = std.fmt.parseInt(u16, line[8..], 10) catch return errors.FluxError.protocol_violation;
+            }
+            if (std.mem.startsWith(u8, line, "sec-webtransport-http3-draft=")) {
+                draft = line[29..];
+            }
+        }
+
+        if (status == null or draft == null) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (!std.mem.eql(u8, draft.?, "draft02")) {
+            return errors.FluxError.protocol_violation;
+        }
+
+        if (status.? != 200) {
+            return errors.FluxError.request_rejected;
+        }
+
+        return .{ .status = status.? };
     }
 };
 
@@ -274,6 +695,41 @@ fn decode_varint(data: []const u8) ?VarInt {
     return .{ .value = value, .consumed = len };
 }
 
+fn apply_h3_settings_to_features(settings: []const H3Setting, out: *NegotiatedFeatures) errors.FluxError!void {
+    for (settings, 0..) |setting, i| {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (settings[j].id == setting.id) {
+                return errors.FluxError.settings_error;
+            }
+        }
+
+        switch (setting.id) {
+            @intFromEnum(h3_core.H3SettingId.enable_connect_protocol) => {
+                if (setting.value > 1) return errors.FluxError.settings_error;
+                out.connect_protocol_enabled = setting.value == 1;
+            },
+            @intFromEnum(h3_core.H3SettingId.h3_datagram) => {
+                if (setting.value > 1) return errors.FluxError.settings_error;
+                out.h3_datagram_enabled = setting.value == 1;
+            },
+            @intFromEnum(h3_core.H3SettingId.enable_webtransport) => {
+                if (setting.value > 1) return errors.FluxError.settings_error;
+                out.webtransport_enabled = setting.value == 1;
+            },
+            @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions) => {
+                if (setting.value == 0) return errors.FluxError.settings_error;
+                out.webtransport_max_sessions = setting.value;
+            },
+            else => {},
+        }
+    }
+
+    if (out.webtransport_enabled and out.webtransport_max_sessions == 0) {
+        return errors.FluxError.settings_error;
+    }
+}
+
 test "wt core tracks session count under negotiated limits" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
@@ -306,18 +762,221 @@ test "negotiation matrix requires connect protocol and webtransport" {
 
     var features = n.negotiate();
     try std.testing.expect(!features.supports_webtransport());
-    try std.testing.expectEqual(TransportPreference.capsule_only, (Core{
-        .allocator = std.testing.allocator,
-        .sessions_open = 0,
-        .negotiated = features,
-        .next_session_id = 1,
-        .active_sessions = std.AutoHashMap(u64, void).init(std.testing.allocator),
-    }).preferred_transport());
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(features);
+    try std.testing.expectEqual(TransportPreference.capsule_only, core.preferred_transport());
 
     n.set_peer_connect_protocol(true);
     features = n.negotiate();
     try std.testing.expect(features.supports_webtransport());
     try std.testing.expect(features.supports_webtransport_datagrams());
+}
+
+test "session registry rejects duplicate ids and emits lifecycle events" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 4,
+    });
+
+    try core.register_session_with_id(42, 13);
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.register_session_with_id(42, 15));
+
+    const opened = core.next_session_event().?;
+    try std.testing.expect(opened == .opened);
+    try std.testing.expectEqual(@as(u64, 42), opened.opened.session_id);
+
+    try core.begin_close_session(42);
+    const closing = core.next_session_event().?;
+    try std.testing.expect(closing == .closing);
+    try std.testing.expectEqual(SessionState.closing, closing.closing.state);
+
+    try core.complete_close_session(42);
+    const closed = core.next_session_event().?;
+    try std.testing.expect(closed == .closed);
+    try std.testing.expectEqual(SessionState.closed, closed.closed.state);
+}
+
+test "session close race is idempotent" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = false,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    try core.register_session_with_id(7, 21);
+    _ = core.next_session_event();
+
+    core.close_session_id(7);
+    core.close_session_id(7);
+
+    const e1 = core.next_session_event().?;
+    const e2 = core.next_session_event().?;
+    try std.testing.expect(e1 == .closing);
+    try std.testing.expect(e2 == .closed);
+    try std.testing.expect(core.next_session_event() == null);
+    try std.testing.expectEqual(@as(usize, 0), core.sessions_open);
+}
+
+test "session stream association for bidi and uni streams" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 4,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const local_bidi_stream_id = try core.open_session_stream(session_id, .bidi);
+    const local_uni_stream_id = try core.open_session_stream(session_id, .uni);
+    try std.testing.expectEqual(session_id, core.get_stream_session_id(local_bidi_stream_id).?);
+    try std.testing.expectEqual(session_id, core.get_stream_session_id(local_uni_stream_id).?);
+
+    const preface = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface);
+    const accepted_session_id = try core.accept_session_stream(999, .bidi, preface);
+    try std.testing.expectEqual(session_id, accepted_session_id);
+    try std.testing.expectEqual(session_id, core.get_stream_session_id(999).?);
+}
+
+test "session stream rejects wrong session and bad preface" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = false,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    _ = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const bad_preface = [_]u8{ 0x01, 0x02 };
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.accept_session_stream(700, .uni, &bad_preface));
+
+    const unknown_session_preface = [_]u8{0x05};
+    try std.testing.expectError(errors.FluxError.invalid_argument, core.accept_session_stream(701, .uni, &unknown_session_preface));
+}
+
+test "session close removes associated streams" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+    const stream_id = try core.open_session_stream(session_id, .bidi);
+    try std.testing.expect(core.get_stream_session_id(stream_id) != null);
+
+    try core.begin_close_session(session_id);
+    _ = core.next_session_event();
+    try core.complete_close_session(session_id);
+    _ = core.next_session_event();
+
+    try std.testing.expect(core.get_stream_session_id(stream_id) == null);
+}
+
+test "session stream partial writes are deterministic" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const adapter_stream_id = try adapter.open_stream(true);
+    _ = adapter.next_event(); // consume stream_opened
+
+    const preface = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface);
+    _ = try core.accept_session_stream(adapter_stream_id, .bidi, preface);
+
+    const payload = "abcdef";
+    const n1 = try core.send_stream_data_partial(&adapter, adapter_stream_id, payload, 2);
+    const n2 = try core.send_stream_data_partial(&adapter, adapter_stream_id, payload[n1..], 2);
+    const n3 = try core.send_stream_data_partial(&adapter, adapter_stream_id, payload[n1 + n2 ..], 10);
+    try std.testing.expectEqual(@as(usize, 2), n1);
+    try std.testing.expectEqual(@as(usize, 2), n2);
+    try std.testing.expectEqual(@as(usize, 2), n3);
+
+    {
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+        try std.testing.expectEqual(transport_adapter.EventKind.stream_data, e.kind);
+        try std.testing.expectEqualStrings("ab", e.payload.?);
+    }
+    {
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+        try std.testing.expectEqual(transport_adapter.EventKind.stream_data, e.kind);
+        try std.testing.expectEqualStrings("cd", e.payload.?);
+    }
+    {
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+        try std.testing.expectEqual(transport_adapter.EventKind.stream_data, e.kind);
+        try std.testing.expectEqualStrings("ef", e.payload.?);
+    }
+}
+
+test "reset and stop-sending block further stream writes" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    const stream_a = try adapter.open_stream(true);
+    _ = adapter.next_event();
+    const preface_a = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface_a);
+    _ = try core.accept_session_stream(stream_a, .bidi, preface_a);
+
+    try core.reset_session_stream(stream_a);
+    try std.testing.expectError(errors.FluxError.stream_closed, core.send_stream_data_partial(&adapter, stream_a, "x", 1));
+
+    const stream_b = try adapter.open_stream(true);
+    _ = adapter.next_event();
+    const preface_b = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface_b);
+    _ = try core.accept_session_stream(stream_b, .uni, preface_b);
+
+    try core.stop_sending_session_stream(stream_b);
+    try std.testing.expectError(errors.FluxError.stream_closed, core.send_stream_data_partial(&adapter, stream_b, "x", 1));
 }
 
 test "negotiation fallback chooses capsule-only when datagram disabled" {
@@ -345,6 +1004,55 @@ test "opening session without negotiated webtransport fails" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
     try std.testing.expectError(errors.FluxError.invalid_state, core.open_session());
+}
+
+test "settings parser maps wt related ids into negotiator" {
+    var n = Negotiator.init();
+
+    try n.apply_local_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.h3_datagram), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 8 },
+    });
+
+    try n.apply_peer_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 3 },
+    });
+
+    const features = n.negotiate();
+    try std.testing.expect(features.supports_webtransport());
+    try std.testing.expect(!features.supports_webtransport_datagrams());
+    try std.testing.expectEqual(@as(u64, 3), features.webtransport_max_sessions);
+}
+
+test "settings parser rejects duplicate and invalid boolean values" {
+    var n = Negotiator.init();
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_local_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_connect_protocol), .value = 1 },
+    }));
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_peer_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 2 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 4 },
+    }));
+}
+
+test "settings parser requires nonzero max sessions for enabled wt" {
+    var n = Negotiator.init();
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_local_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+        .{ .id = @intFromEnum(h3_core.H3SettingId.webtransport_max_sessions), .value = 0 },
+    }));
+
+    try std.testing.expectError(errors.FluxError.settings_error, n.apply_peer_h3_settings(&.{
+        .{ .id = @intFromEnum(h3_core.H3SettingId.enable_webtransport), .value = 1 },
+    }));
 }
 
 test "session datagram routing validates context and payload bounds" {
@@ -429,4 +1137,181 @@ test "session datagram receive rejects unknown session" {
 
     try adapter.inject_datagram_received(wire.items);
     try std.testing.expectError(errors.FluxError.invalid_argument, core.recv_session_datagram(&adapter));
+}
+
+test "session datagram send applies backpressure and recovers on ack" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+    adapter.set_datagram_enabled(true);
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 1,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+
+    var i: usize = 0;
+    while (i < MAX_INFLIGHT_WT_DATAGRAMS) : (i += 1) {
+        _ = try core.send_session_datagram(&adapter, session_id, 1, "d");
+        var e = adapter.next_event().?;
+        defer adapter.release_event(&e);
+    }
+
+    try std.testing.expectError(errors.FluxError.backpressure, core.send_session_datagram(&adapter, session_id, 1, "d"));
+
+    try core.acknowledge_session_datagram_send(session_id, 1);
+    _ = try core.send_session_datagram(&adapter, session_id, 1, "d");
+}
+
+test "late datagram is rejected when session starts closing" {
+    var adapter = transport_adapter.Adapter.init(std.testing.allocator);
+    defer adapter.deinit();
+    adapter.set_datagram_enabled(true);
+
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 1,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+    try core.begin_close_session(session_id);
+    _ = core.next_session_event();
+
+    var wire: std.ArrayList(u8) = .{};
+    defer wire.deinit(std.testing.allocator);
+    try append_varint(std.testing.allocator, &wire, session_id);
+    try append_varint(std.testing.allocator, &wire, 5);
+    try wire.appendSlice(std.testing.allocator, "late");
+
+    try adapter.inject_datagram_received(wire.items);
+    try std.testing.expectError(errors.FluxError.stream_closed, core.recv_session_datagram(&adapter));
+}
+
+test "webtransport connect handshake round trip succeeds" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 4,
+    });
+
+    const req_encoded = try core.encode_connect_request(.{
+        .authority = "example.test",
+        .path = "/wt",
+        .origin = "https://example.test",
+    });
+    defer std.testing.allocator.free(req_encoded);
+
+    const parsed_req = try core.validate_connect_request(req_encoded);
+    defer core.free_connect_request(parsed_req);
+    try std.testing.expectEqualStrings("example.test", parsed_req.authority);
+    try std.testing.expectEqualStrings("/wt", parsed_req.path);
+
+    const rsp_encoded = try core.encode_connect_response(.{ .status = 200 });
+    defer std.testing.allocator.free(rsp_encoded);
+    const parsed_rsp = try core.validate_connect_response(rsp_encoded);
+    try std.testing.expectEqual(@as(u16, 200), parsed_rsp.status);
+}
+
+test "webtransport connect request rejects missing pseudo headers" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = false,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const missing_protocol = ":method=CONNECT\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n";
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.validate_connect_request(missing_protocol));
+
+    const invalid_method = ":method=GET\n:protocol=webtransport\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n";
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.validate_connect_request(invalid_method));
+}
+
+test "webtransport connect response handles rejection and bad draft" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const rejected = ":status=403\nsec-webtransport-http3-draft=draft02\n";
+    try std.testing.expectError(errors.FluxError.request_rejected, core.validate_connect_response(rejected));
+
+    const bad_draft = ":status=200\nsec-webtransport-http3-draft=draft01\n";
+    try std.testing.expectError(errors.FluxError.protocol_violation, core.validate_connect_response(bad_draft));
+}
+
+test "webtransport connect handshake requires negotiated settings" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    try std.testing.expectError(errors.FluxError.invalid_state, core.encode_connect_request(.{
+        .authority = "example.test",
+        .path = "/wt",
+        .origin = "https://example.test",
+    }));
+
+    try std.testing.expectError(errors.FluxError.invalid_state, core.validate_connect_request(
+        ":method=CONNECT\n:protocol=webtransport\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n",
+    ));
+}
+
+test "lsquic parity in-module: wt setting ids negotiate capabilities" {
+    var n = Negotiator.init();
+
+    try n.apply_local_h3_settings(&.{
+        .{ .id = 0x08, .value = 1 },
+        .{ .id = 0x33, .value = 1 },
+        .{ .id = 0x2b603742, .value = 1 },
+        .{ .id = 0x2b603743, .value = 8 },
+    });
+    try n.apply_peer_h3_settings(&.{
+        .{ .id = 0x08, .value = 1 },
+        .{ .id = 0x33, .value = 0 },
+        .{ .id = 0x2b603742, .value = 1 },
+        .{ .id = 0x2b603743, .value = 3 },
+    });
+
+    const features = n.negotiate();
+    try std.testing.expect(features.supports_webtransport());
+    try std.testing.expect(!features.supports_webtransport_datagrams());
+    try std.testing.expectEqual(@as(u64, 3), features.webtransport_max_sessions);
+}
+
+test "lsquic parity in-module: wt stream preface association" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+    const preface = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface);
+
+    const accepted = try core.accept_session_stream(501, .bidi, preface);
+    try std.testing.expectEqual(session_id, accepted);
 }

@@ -775,3 +775,33 @@ test "blocked stream release after acked insert count update" {
     try sync.recv_decoder_bytes("inc:1\n");
     try std.testing.expect(!sync.is_stream_blocked(102));
 }
+
+test "lsquic parity in-module: partial drains preserve insert stream" {
+    var sync = ControlSync.init(std.testing.allocator);
+    defer sync.deinit();
+
+    _ = try sync.queue_insert_instruction("x-h1", "one");
+    _ = try sync.queue_insert_instruction("x-h2", "two");
+
+    const a = try sync.drain_encoder_chunk(3);
+    defer std.testing.allocator.free(a);
+    const b = try sync.drain_encoder_chunk(4);
+    defer std.testing.allocator.free(b);
+    const c = try sync.drain_encoder_chunk(1024);
+    defer std.testing.allocator.free(c);
+
+    var all: std.ArrayList(u8) = .{};
+    defer all.deinit(std.testing.allocator);
+    try all.appendSlice(std.testing.allocator, a);
+    try all.appendSlice(std.testing.allocator, b);
+    try all.appendSlice(std.testing.allocator, c);
+
+    try sync.recv_encoder_bytes(all.items);
+    try std.testing.expectEqual(@as(u64, 2), sync.known_insert_count);
+}
+
+test "lsquic parity in-module: malformed ack rejected" {
+    var sync = ControlSync.init(std.testing.allocator);
+    defer sync.deinit();
+    try std.testing.expectError(errors.FluxError.protocol_violation, sync.recv_decoder_bytes("ack:abc:2\n"));
+}
