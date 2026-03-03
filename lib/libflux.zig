@@ -11,6 +11,7 @@ pub const wt_core = @import("wt_core.zig");
 pub const wt_capsule = @import("wt_capsule.zig");
 pub const lsquic_parity = @import("lsquic_parity.zig");
 pub const negative_corpus = @import("negative_corpus.zig");
+pub const interop_scenarios = @import("interop_scenarios.zig");
 pub const public_api = @import("public_api.zig");
 pub const errors = @import("errors.zig");
 
