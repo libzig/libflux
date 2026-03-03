@@ -302,3 +302,48 @@ test "decoder parses multiple frames with chunked input" {
         try std.testing.expectEqualStrings("body", frame.data);
     }
 }
+
+test "lsquic parity in-module: split HEADERS frame decode" {
+    const wire = try encode_headers(std.testing.allocator, "xyz");
+    defer std.testing.allocator.free(wire);
+
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    try decoder.feed(wire[0..1]);
+    try std.testing.expect(decoder.next_frame() == null);
+    try decoder.feed(wire[1..]);
+
+    var frame = decoder.next_frame().?;
+    defer decoder.release_frame(&frame);
+    try std.testing.expect(frame == .headers);
+    try std.testing.expectEqualStrings("xyz", frame.headers);
+}
+
+test "lsquic parity in-module: coalesced HEADERS then DATA" {
+    const headers = try encode_headers(std.testing.allocator, "h");
+    defer std.testing.allocator.free(headers);
+    const data = try encode_data(std.testing.allocator, "payload");
+    defer std.testing.allocator.free(data);
+
+    var combined: std.ArrayList(u8) = .{};
+    defer combined.deinit(std.testing.allocator);
+    try combined.appendSlice(std.testing.allocator, headers);
+    try combined.appendSlice(std.testing.allocator, data);
+
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+    try decoder.feed(combined.items);
+
+    {
+        var headers_frame = decoder.next_frame().?;
+        defer decoder.release_frame(&headers_frame);
+        try std.testing.expect(headers_frame == .headers);
+    }
+    {
+        var frame = decoder.next_frame().?;
+        defer decoder.release_frame(&frame);
+        try std.testing.expect(frame == .data);
+        try std.testing.expectEqualStrings("payload", frame.data);
+    }
+}

@@ -452,3 +452,45 @@ test "control reader ignores unknown frames" {
     try std.testing.expect(event == .settings);
     try std.testing.expect(reader.next_event() == null);
 }
+
+test "lsquic parity in-module: cancel_push and max_push_id vectors" {
+    var reader = Reader.init(std.testing.allocator);
+    defer reader.deinit();
+
+    var wire: std.ArrayList(u8) = .{};
+    defer wire.deinit(std.testing.allocator);
+    try append_frame(std.testing.allocator, &wire, @intFromEnum(h3_core.H3FrameType.settings), "");
+
+    var payload: std.ArrayList(u8) = .{};
+    defer payload.deinit(std.testing.allocator);
+    try append_varint(std.testing.allocator, &payload, 0x123445);
+    try append_frame(std.testing.allocator, &wire, @intFromEnum(h3_core.H3FrameType.cancel_push), payload.items);
+
+    payload.clearRetainingCapacity();
+    try append_varint(std.testing.allocator, &payload, 291);
+    try append_frame(std.testing.allocator, &wire, @intFromEnum(h3_core.H3FrameType.max_push_id), payload.items);
+
+    try reader.feed(wire.items);
+    _ = reader.next_event().?; // settings
+
+    {
+        var e = reader.next_event().?;
+        defer reader.release_event(&e);
+        try std.testing.expect(e == .cancel_push);
+        try std.testing.expectEqual(@as(u64, 0x123445), e.cancel_push);
+    }
+    {
+        var e = reader.next_event().?;
+        defer reader.release_event(&e);
+        try std.testing.expect(e == .max_push_id);
+        try std.testing.expectEqual(@as(u64, 291), e.max_push_id);
+    }
+}
+
+test "lsquic parity in-module: malformed scalar payload fails" {
+    var reader = Reader.init(std.testing.allocator);
+    defer reader.deinit();
+
+    const bad = [_]u8{ @intFromEnum(h3_core.H3FrameType.settings), 0x00, @intFromEnum(h3_core.H3FrameType.goaway), 0x02, 0x01, 0x00 };
+    try std.testing.expectError(errors.FluxError.protocol_violation, reader.feed(&bad));
+}

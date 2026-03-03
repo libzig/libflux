@@ -1,6 +1,0 @@
-# source_test	libflux_target	status	notes
-xtra/lsquic/tests/test_hcsi_reader.c	lib/lsquic_parity.zig (h3_control_reader case)	implemented	Control stream parser vectors covered by parity tests + module tests
-xtra/lsquic/tests/test_h3_framing.c	lib/lsquic_parity.zig (h3_framing case)	implemented	Split/chunk and zero-length DATA behavior covered
-xtra/lsquic/tests/test_send_headers.c	lib/lsquic_parity.zig (qpack_control_sync case)	implemented	Header send partial/full control stream behavior covered
-xtra/lsquic/src/liblsquic/lsquic_stream.c (WT paths)	lib/lsquic_parity.zig (wt_streams case)	implemented	Session-stream association and lifecycle paths covered
-xtra/lsquic/src/liblsquic/lsquic_hcso_writer.c (WT settings)	lib/lsquic_parity.zig (wt_settings case)	implemented	Settings IDs 0x2b603742, 0x2b603743, and 0x33 behavior covered

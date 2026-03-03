@@ -1274,3 +1274,44 @@ test "webtransport connect handshake requires negotiated settings" {
         ":method=CONNECT\n:protocol=webtransport\n:scheme=https\n:authority=example.test\n:path=/wt\norigin=https://example.test\n",
     ));
 }
+
+test "lsquic parity in-module: wt setting ids negotiate capabilities" {
+    var n = Negotiator.init();
+
+    try n.apply_local_h3_settings(&.{
+        .{ .id = 0x08, .value = 1 },
+        .{ .id = 0x33, .value = 1 },
+        .{ .id = 0x2b603742, .value = 1 },
+        .{ .id = 0x2b603743, .value = 8 },
+    });
+    try n.apply_peer_h3_settings(&.{
+        .{ .id = 0x08, .value = 1 },
+        .{ .id = 0x33, .value = 0 },
+        .{ .id = 0x2b603742, .value = 1 },
+        .{ .id = 0x2b603743, .value = 3 },
+    });
+
+    const features = n.negotiate();
+    try std.testing.expect(features.supports_webtransport());
+    try std.testing.expect(!features.supports_webtransport_datagrams());
+    try std.testing.expectEqual(@as(u64, 3), features.webtransport_max_sessions);
+}
+
+test "lsquic parity in-module: wt stream preface association" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.apply_negotiated_features(.{
+        .connect_protocol_enabled = true,
+        .h3_datagram_enabled = true,
+        .webtransport_enabled = true,
+        .webtransport_max_sessions = 2,
+    });
+
+    const session_id = try core.open_session_id();
+    _ = core.next_session_event();
+    const preface = try core.encode_stream_preface(session_id);
+    defer std.testing.allocator.free(preface);
+
+    const accepted = try core.accept_session_stream(501, .bidi, preface);
+    try std.testing.expectEqual(session_id, accepted);
+}
