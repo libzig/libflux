@@ -1,6 +1,6 @@
 .{
     .name = .libflux,
-    .version = "0.0.4",
+    .version = "0.0.5",
     .dependencies = .{
         .libfast = .{
             .url = "git+https://github.com/bresilla/libfast?ref=0.0.14",
