@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.5] - 2026-03-04
+
+### <!-- 0 -->⛰️  Features
+
+- Update libfast dependency to 0.0.14
+
 ## [0.0.3] - 2026-03-03
 
 ### <!-- 0 -->⛰️  Features

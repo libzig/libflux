@@ -1,10 +1,10 @@
 .{
     .name = .libflux,
-    .version = "0.0.4",
+    .version = "0.0.5",
     .dependencies = .{
         .libfast = .{
-            .url = "https://github.com/bresilla/libfast/archive/refs/tags/0.0.13.tar.gz",
-            .hash = "libfast-0.0.13-Gf9gLltPDwD7C660dH8kyu2CgmGOW1cSc612ORoCI9il",
+            .url = "git+https://github.com/bresilla/libfast?ref=0.0.14",
+            .hash = "libfast-0.0.14-BoxUpXWTDAAic6dCXxnaBT43IYEZCv1BmRLLdij5c8A9",
         },
     },
     .paths = .{
@@ -14,5 +14,5 @@
         "examples",
         "lib",
     },
-    .fingerprint = 0x4e656d76eca6c94f,
+    .fingerprint = 0x4e656d76b3f0f46e,
 }
