@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.6] - 2026-03-04
+
+### <!-- 3 -->📚 Documentation
+
+- Add initial documentation files
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Update libfast dependency
+
 ## [0.0.5] - 2026-03-04
 
 ### <!-- 0 -->⛰️  Features
